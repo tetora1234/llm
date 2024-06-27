@@ -1,3 +1,5 @@
+import os
+import pickle
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -24,6 +26,21 @@ class TransformerXLConfig:
         self.block_size = block_size
         self.mem_len = mem_len
         self.dropout = dropout
+
+    def to_dict(self):
+        return {
+            "vocab_size": self.vocab_size,
+            "n_embd": self.n_embd,
+            "n_head": self.n_head,
+            "n_layer": self.n_layer,
+            "block_size": self.block_size,
+            "mem_len": self.mem_len,
+            "dropout": self.dropout
+        }
+
+    @classmethod
+    def from_dict(cls, config_dict):
+        return cls(**config_dict)
 
 # TransformerXLモデルの定義
 class TransformerXLModel(nn.Module):
@@ -281,8 +298,8 @@ if __name__ == "__main__":
         n_embd=768,        # 埋め込みの次元
         n_head=4,         # 注意ヘッドの数
         n_layer=4,        # レイヤー数
-        block_size=1024,   # 最大シーケンス長
-        mem_len=1024,      # メモリ長
+        block_size=2048,   # 最大シーケンス長
+        mem_len=2048,      # メモリ長
         dropout=0.1        # ドロップアウト率
     )
 
@@ -290,7 +307,7 @@ if __name__ == "__main__":
     model = TransformerXLModel(config)
 
     # データの読み込みと前処理
-    with open('./text-generate/instruction_dataset.jsonl', 'r', encoding='utf-8') as f:
+    with open('./text-generate/filtered_instruction_dataset.jsonl', 'r', encoding='utf-8') as f:
         data = [json.loads(line) for line in f]
 
     # データセットの作成
@@ -300,10 +317,27 @@ if __name__ == "__main__":
     val_dataset = TextDataset(val_data, config)
 
     # トレーニングの実行
-    train(model, train_dataset, val_dataset, epochs=10, batch_size=4, lr=3e-5)
+    train(model, train_dataset, val_dataset, epochs=100, batch_size=4, lr=1e-4)
+
+    # 保存ディレクトリの作成
+    save_directory = "./text-generate/models"
+    os.makedirs(save_directory, exist_ok=True)
 
     # モデルの保存（safetensors形式）
+    model_path = os.path.join(save_directory, "japanese_transformerxl_model.safetensors")
     state_dict = model.state_dict()
-    save_file(state_dict, "./text-generate/models/japanese_transformerxl_model.safetensors")
+    save_file(state_dict, model_path)
 
-    print("トレーニングが完了し、モデルがsafetensors形式で保存されました。")
+    # モデルの設定保存
+    config_path = os.path.join(save_directory, "config.json")
+    config_dict = config.to_dict()
+    with open(config_path, 'w') as f:  # テキストモードでファイルを開く
+        json.dump(config_dict, f)
+
+    # トークナイザーの保存
+    tokenizer_path = os.path.join(save_directory, "tokenizer.pkl")
+    with open(tokenizer_path, 'wb') as f:
+        pickle.dump(tokenizer, f)
+
+    print(f"トレーニングが完了し、モデルがsafetensors形式で保存されました: {model_path}")
+    print(f"トークナイザーが保存されました: {tokenizer_path}")

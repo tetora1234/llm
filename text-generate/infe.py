@@ -1,87 +1,259 @@
+import os
+import pickle
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import sys
+from torch import nn
+from torch.nn import functional as F
+from safetensors.torch import load_file
+import json
+import math
 
-model_path = r"C:\Users\nider\Desktop\git\llm\My-Finetuned-Japanese-Model-1b"
+# モデルの設定
+class TransformerXLConfig:
+    def __init__(self, vocab_size, n_embd, n_head, n_layer, block_size, mem_len, dropout=0.1):
+        self.vocab_size = vocab_size
+        self.n_embd = n_embd
+        self.n_head = n_head
+        self.n_layer = n_layer
+        self.block_size = block_size
+        self.mem_len = mem_len
+        self.dropout = dropout
 
-# GPUが利用可能かチェック
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-print(f"使用デバイス: {device}")
+    def to_dict(self):
+        return {
+            "vocab_size": self.vocab_size,
+            "n_embd": self.n_embd,
+            "n_head": self.n_head,
+            "n_layer": self.n_layer,
+            "block_size": self.block_size,
+            "mem_len": self.mem_len,
+            "dropout": self.dropout
+        }
 
-# トークナイザーとモデルの読み込み
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-model = AutoModelForCausalLM.from_pretrained(model_path)
+    @classmethod
+    def from_dict(cls, config_dict):
+        return cls(**config_dict)
 
-# トークナイザーの語彙サイズをモデルに合わせる
-if len(tokenizer) != model.config.vocab_size:
-    print("トークナイザーの語彙サイズを更新しています...")
-    tokenizer.resize_token_embeddings(model.config.vocab_size)
+# TransformerXLモデルの定義
+class TransformerXLModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
 
-print(f"更新後のトークナイザーの語彙サイズ: {len(tokenizer)}")
-print(f"モデルの語彙サイズ: {model.config.vocab_size}")
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            drop = nn.Dropout(config.dropout),
+            h = nn.ModuleList([TransformerXLBlock(config) for _ in range(config.n_layer)]),
+            ln_f = nn.LayerNorm(config.n_embd)
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-model.to(device)
+    def forward(self, idx, mems=None, targets=None):
+        device = idx.device
+        if isinstance(idx, (list, tuple)):
+            idx = torch.tensor(idx, dtype=torch.long, device=device)
+        if idx.dim() == 1:
+            idx = idx.unsqueeze(0)  # (1, seq_len)となるように調整
+        elif idx.dim() == 3:
+            idx = idx.squeeze(1)  # (batch, 1, seq_len) -> (batch, seq_len)
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
 
-print("モデルの読み込みが完了しました。")
+        # 以下は変更なし
+        tok_emb = self.transformer.wte(idx)
+        x = self.transformer.drop(tok_emb)
 
-initial_prompt = """タイトル：隣の部屋で、ボクっ娘幼馴染のＮＴＲごっくんフェラチオ
+        new_mems = []
+        if mems is None:
+            mems = [None] * self.config.n_layer
+        for layer, mem in zip(self.transformer.h, mems):
+            x, new_mem = layer(x, mem)
+            new_mems.append(new_mem)
 
-"""
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
 
-def generate_text_stream(prompt, max_new_tokens=1000):
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        # 損失計算
+        loss = None
+        if targets is not None:
+            targets = targets[:, :logits.size(1)]
+            logits = logits[:, :targets.size(1), :]
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
+
+        return (logits, loss, new_mems)  # タプルとして明示的に返す
+
+        # 損失計算
+        loss = None
+        if targets is not None:
+            targets = targets[:, :logits.size(1)]
+            logits = logits[:, :targets.size(1), :]
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
+
+        return (logits, loss, new_mems)
+
+# TransformerXLブロックの定義
+class TransformerXLBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = RelativeMultiHeadAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp = nn.ModuleDict(dict(
+            c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd),
+            c_proj  = nn.Linear(4 * config.n_embd, config.n_embd),
+            act     = nn.GELU(),
+            dropout = nn.Dropout(config.dropout),
+        ))
+
+    def forward(self, x, mem):
+        x, new_mem = self.attn(self.ln_1(x), mem)
+        x = x + self.mlp_forward(self.ln_2(x))
+        return x, new_mem
+
+    def mlp_forward(self, x):
+        x = self.mlp.c_fc(x)
+        x = self.mlp.act(x)
+        x = self.mlp.c_proj(x)
+        x = self.mlp.dropout(x)
+        return x
+
+# 相対位置を考慮したマルチヘッド注意機構の定義
+class RelativeMultiHeadAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        self.mem_len = config.mem_len
+
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+        self.r_emb = nn.Parameter(torch.Tensor(self.n_head, config.n_embd // self.n_head))
+        self.r_bias = nn.Parameter(torch.Tensor(self.n_head, config.n_embd // self.n_head))
+
+        nn.init.normal_(self.r_emb, 0.0, 0.02)
+        nn.init.normal_(self.r_bias, 0.0, 0.02)
+
+    def forward(self, x, mem):
+        B, T, C = x.size()
+
+        if mem is None:
+            mem = torch.empty(B, 0, C).to(x.device)
+        else:
+            mem = mem.view(B, -1, C)
+
+        cat = torch.cat([mem, x], dim=1)
+        K = cat.size(1)
+
+        q, k, v = self.c_attn(cat).split(self.n_embd, dim=2)
+        q = q.view(B, K, self.n_head, C // self.n_head).transpose(1, 2)
+        k = k.view(B, K, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, K, self.n_head, C // self.n_head).transpose(1, 2)
+
+        q = q + self.r_bias.view(1, self.n_head, 1, C // self.n_head)
+        r = self.r_emb.unsqueeze(1).expand(self.n_head, K, C // self.n_head)
+
+        AC = torch.matmul(q, k.transpose(-2, -1))
+        BD = torch.matmul(q, r.transpose(-2, -1))
+        BD = self._rel_shift(BD)
+
+        attn = AC + BD
+        attn = attn / math.sqrt(self.n_embd // self.n_head)
+        attn = F.softmax(attn, dim=-1)
+        attn = self.attn_dropout(attn)
+
+        y = torch.matmul(attn, v)
+        y = y.transpose(1, 2).contiguous().view(B, K, C)
+
+        y = self.resid_dropout(self.c_proj(y))
+
+        new_mem = cat[:, -self.mem_len:]
+
+        return y, new_mem
+
+    def _rel_shift(self, x):
+        zero_pad = torch.zeros((x.size(0), x.size(1), x.size(2), 1),
+                               device=x.device, dtype=x.dtype)
+        x_padded = torch.cat([zero_pad, x], dim=3)
+        x_padded = x_padded.view(x.size(0), x.size(1), x.size(3) + 1, x.size(2))
+        x = x_padded[:, :, 1:].view_as(x)
+        return x
+
+# テキスト生成関数
+def generate_text(model, tokenizer, prompt, max_length=100, temperature=1.0, top_k=50):
+    model.eval()
+    tokens = tokenizer.encode(prompt)
+    input_ids = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(device)
     
-    generated_tokens = []
-    for i in range(max_new_tokens):
-        with torch.no_grad():
-            output = model.generate(
-                inputs.input_ids,
-                max_new_tokens=1,
-                do_sample=True,
-                temperature=0.8,
-                top_p=0.95,
-                top_k=100,
-                repetition_penalty=1.1,
-                num_return_sequences=1,
-                pad_token_id=tokenizer.eos_token_id
-            )
-        
-        new_token = output[0][-1]
-        # トークンIDをモデルの語彙サイズ内に制限
-        new_token = torch.clamp(new_token, max=model.config.vocab_size-1)
-        generated_tokens.append(new_token)
-        
-        try:
-            decoded_token = tokenizer.decode(new_token)
-            print(decoded_token, end='', flush=True)
-            sys.stdout.flush()
-        except KeyError:
-            print(f"[Unknown token: {new_token.item()}]", end='', flush=True)
-        
-        if new_token.item() == tokenizer.eos_token_id:
-            break
-        
-        inputs.input_ids = torch.cat([inputs.input_ids, new_token.unsqueeze(0)], dim=-1)
+    mems = None
+    generated = []
     
-    return tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    with torch.no_grad():
+        for _ in range(max_length):
+            # input_ids の形状を確認し、必要に応じて調整
+            if input_ids.dim() == 1:
+                input_ids = input_ids.unsqueeze(0)
+            elif input_ids.dim() == 3:
+                input_ids = input_ids.squeeze(1)
+            
+            outputs = model(input_ids, mems=mems)
+            logits, _, new_mems = outputs  # アンパックを明示的に行う
+            mems = new_mems
+            
+            logits = logits[:, -1, :] / temperature
+            
+            # Top-k サンプリング
+            top_k_logits, top_k_indices = torch.topk(logits, k=top_k)
+            probs = F.softmax(top_k_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            next_token = top_k_indices.gather(-1, next_token)
+            
+            generated.append(next_token.item())
+            input_ids = next_token.unsqueeze(0)
+            
+            if next_token.item() == tokenizer.encode('<|endoftext|>')[0]:
+                break
+    
+    return tokenizer.decode(generated)
 
-try:
-    generated_text = generate_text_stream(initial_prompt)
-    initial_prompt += generated_text
+if __name__ == "__main__":
+    # モデルの読み込み
+    model_path = "./text-generate/models/japanese_transformerxl_model.safetensors"
+    config_path = "./text-generate/models/config.json"
+    tokenizer_path = "./text-generate/models/tokenizer.pkl"
 
-    # コンテキストの長さを管理
-    max_context_length = 10000
-    if len(initial_prompt) > max_context_length:
-        initial_prompt = initial_prompt[-max_context_length:]
+    # ファイルの存在を確認
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    if not os.path.exists(tokenizer_path):
+        raise FileNotFoundError(f"Tokenizer file not found: {tokenizer_path}")
 
-    print("\n\n生成されたテキスト:")
-    print(initial_prompt)
+    # 設定の読み込み
+    with open(config_path, 'r') as f:
+        config_dict = json.load(f)
+    config = TransformerXLConfig.from_dict(config_dict)
 
-except Exception as e:
-    print(f"エラーが発生しました: {str(e)}")
-    print("トークナイザーとモデルの詳細:")
-    print(f"トークナイザータイプ: {type(tokenizer)}")
-    print(f"モデルタイプ: {type(model)}")
-    print(f"トークナイザーの語彙サイズ: {len(tokenizer)}")
-    print(f"モデルの語彙サイズ: {model.config.vocab_size}")
-    raise  # エラーの詳細な情報を表示
+    # モデルの初期化と重みの読み込み
+    model = TransformerXLModel(config)
+    state_dict = load_file(model_path)
+    model.load_state_dict(state_dict)
+
+    # トークナイザーの読み込み
+    with open(tokenizer_path, 'rb') as f:
+        tokenizer = pickle.load(f)
+
+    # GPUが利用可能な場合はGPUを使用
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    # テキスト生成の例
+    prompt = "タイトル: 隣の部屋で、ボクっ娘幼馴染のＮＴＲごっくんフェラチオ\n本文: "
+    generated_text = generate_text(model, tokenizer, prompt, max_length=200, temperature=0.7, top_k=50)
+
+    print("生成されたテキスト:")
+    print(generated_text)
