@@ -8,6 +8,10 @@ from encode_swe import SWEEncoder_ja
 import json
 import math
 from safetensors.torch import save_file
+import torch.cuda.amp as amp
+from torch.nn.utils import clip_grad_norm_
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import re
 
 # トークナイザーの初期化
 with open('./text-generate/ja-swe32kfix.txt', 'r', encoding='utf-8') as f:
@@ -18,7 +22,7 @@ tokenizer = SWEEncoder_ja(bpe, emoji)
 
 # モデルの設定
 class TransformerXLConfig:
-    def __init__(self, vocab_size, n_embd, n_head, n_layer, block_size, mem_len, dropout=0.1):
+    def __init__(self, vocab_size, n_embd, n_head, n_layer, block_size, mem_len, dropout=0.1, gradient_accumulation_steps=1):
         self.vocab_size = vocab_size
         self.n_embd = n_embd
         self.n_head = n_head
@@ -26,6 +30,7 @@ class TransformerXLConfig:
         self.block_size = block_size
         self.mem_len = mem_len
         self.dropout = dropout
+        self.gradient_accumulation_steps = gradient_accumulation_steps
 
     def to_dict(self):
         return {
@@ -35,7 +40,8 @@ class TransformerXLConfig:
             "n_layer": self.n_layer,
             "block_size": self.block_size,
             "mem_len": self.mem_len,
-            "dropout": self.dropout
+            "dropout": self.dropout,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps
         }
 
     @classmethod
@@ -104,6 +110,7 @@ class TransformerXLBlock(nn.Module):
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = RelativeMultiHeadAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.ln_3 = nn.LayerNorm(config.n_embd)
         self.mlp = nn.ModuleDict(dict(
             c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd),
             c_proj  = nn.Linear(4 * config.n_embd, config.n_embd),
@@ -205,7 +212,7 @@ class TextDataset(Dataset):
         self.examples = []
         
         for item in data:
-            text = f"タイトル: {item['タイトル']}\n本文: {item['本文']}"
+            text = self.normalize_text(f"タイトル: {item['タイトル']}\n本文: {item['本文']}")
             tokenized = self.tokenizer.encode(text)
             if len(tokenized) > self.block_size:
                 for i in range(0, len(tokenized) - self.block_size + 1, self.block_size):
@@ -243,39 +250,78 @@ class TextDataset(Dataset):
             mem = mem + [[0] * self.n_embd for _ in range(self.mem_len - len(mem))]
         return torch.tensor(chunk, dtype=torch.long), torch.tensor(mem, dtype=torch.float)
 
+    def normalize_text(self, text):
+        # 簡単な正規化の例
+        text = text.lower()
+        text = re.sub(r'\s+', ' ', text)
+        return text
+
+# Early Stoppingの実装
+class EarlyStopping:
+    def __init__(self, patience=7, min_delta=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+
+    def __call__(self, val_loss):
+        if self.best_loss == None:
+            self.best_loss = val_loss
+        elif self.best_loss - val_loss > self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+        elif self.best_loss - val_loss < self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+
 # トレーニング関数（メモリ対応）
+from safetensors.torch import save_file, load_file
+
 def train(model, train_dataset, val_dataset, epochs, batch_size, lr):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-
+    
+    scaler = amp.GradScaler()  # 混合精度訓練用のスケーラー
+    
     for epoch in range(epochs):
         model.train()
         total_loss = 0
-        for batch, mem in train_loader:
-            print(f"Batch shape: {batch.shape}")
-            print(f"Mem shape: {mem.shape}")
-            
+        optimizer.zero_grad()  # エポックの開始時にグラデーントをリセット
+
+        for i, (batch, mem) in enumerate(train_loader):
             batch = batch.to(device)
             mem = mem.to(device)
             
-            # バッチとメモリの形状を調整
             B, T = batch.size()
             mem = mem.view(B, model.config.mem_len, model.config.n_embd)
             mems = [mem] * model.config.n_layer
             
-            optimizer.zero_grad()
-            _, loss, _ = model(batch, mems=mems, targets=batch)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+            with amp.autocast():  # 混合精度訓練
+                _, loss, _ = model(batch, mems=mems, targets=batch)
+                loss = loss / model.config.gradient_accumulation_steps
+
+            scaler.scale(loss).backward()
+            total_loss += loss.item() * model.config.gradient_accumulation_steps
+
+            if (i + 1) % model.config.gradient_accumulation_steps == 0:
+                scaler.unscale_(optimizer)
+                clip_grad_norm_(model.parameters(), max_norm=0.5)  # グラデーントクリッピングの閾値を0.5に変更
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()  # 累積後にグラデーントをリセット
         
-        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {total_loss/len(train_loader):.4f}")
+        avg_train_loss = total_loss / len(train_loader)
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}")
 
         model.eval()
         val_loss = 0
+        num_val_batches = len(val_loader)
         with torch.no_grad():
             for batch, mem in val_loader:
                 batch = batch.to(device)
@@ -289,18 +335,23 @@ def train(model, train_dataset, val_dataset, epochs, batch_size, lr):
                 _, loss, _ = model(batch, mems=mems, targets=batch)
                 val_loss += loss.item()
         
-        print(f"Epoch {epoch+1}/{epochs}, Validation Loss: {val_loss/len(val_loader):.4f}")
-          
+        avg_val_loss = val_loss / num_val_batches
+        print(f"Epoch {epoch+1}/{epochs}, Validation Loss: {avg_val_loss:.4f}")
+
+        # 学習率の調整
+        scheduler.step(avg_val_loss)
+    return model
+
 if __name__ == "__main__":
     # モデル設定
     config = TransformerXLConfig(
-        vocab_size=32000,  # トークナイザーの語彙サイズ
-        n_embd=768,        # 埋め込みの次元
-        n_head=4,         # 注意ヘッドの数
-        n_layer=4,        # レイヤー数
-        block_size=2048,   # 最大シーケンス長
-        mem_len=2048,      # メモリ長
-        dropout=0.1        # ドロップアウト率
+        vocab_size=32000,
+        n_embd=512,        # 埋め込みの次元を減らす
+        n_head=2,
+        n_layer=2,
+        block_size=4096,   # ブロックサイズを増やす
+        mem_len=4096,      # メモリ長を増やす
+        dropout=0.1
     )
 
     # モデルの初期化
@@ -317,7 +368,7 @@ if __name__ == "__main__":
     val_dataset = TextDataset(val_data, config)
 
     # トレーニングの実行
-    train(model, train_dataset, val_dataset, epochs=100, batch_size=4, lr=1e-4)
+    model = train(model, train_dataset, val_dataset, epochs=1, batch_size=1, lr=1e-3)
 
     # 保存ディレクトリの作成
     save_directory = "./text-generate/models"
