@@ -277,9 +277,9 @@ class EarlyStopping:
                 self.early_stop = True
 
 # トレーニング関数（メモリ対応）
-from safetensors.torch import save_file, load_file
+from safetensors.torch import save_file
 
-def train(model, train_dataset, val_dataset, epochs, batch_size, lr):
+def train(model, train_dataset, val_dataset, epochs, batch_size, lr, save_directory):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)
@@ -311,46 +311,32 @@ def train(model, train_dataset, val_dataset, epochs, batch_size, lr):
 
             if (i + 1) % model.config.gradient_accumulation_steps == 0:
                 scaler.unscale_(optimizer)
-                clip_grad_norm_(model.parameters(), max_norm=0.5)  # グラデーントクリッピングの閾値を0.5に変更
+                clip_grad_norm_(model.parameters(), max_norm=0.5)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()  # 累積後にグラデーントをリセット
         
         avg_train_loss = total_loss / len(train_loader)
         print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}")
+   
+        # 20エポックごとにモデルを保存
+        if (epoch + 1) % 20 == 0:
+            model_path = os.path.join(save_directory, f"japanese_transformerxl_model_epoch_{epoch+1}.safetensors")
+            state_dict = model.state_dict()
+            save_file(state_dict, model_path)
+            print(f"Model saved at epoch {epoch+1}")
 
-        model.eval()
-        val_loss = 0
-        num_val_batches = len(val_loader)
-        with torch.no_grad():
-            for batch, mem in val_loader:
-                batch = batch.to(device)
-                mem = mem.to(device)
-                
-                # メモリの形状を調整
-                B, T = batch.size()
-                mem = mem.view(B, model.config.mem_len, model.config.n_embd)
-                mems = [mem] * model.config.n_layer
-                
-                _, loss, _ = model(batch, mems=mems, targets=batch)
-                val_loss += loss.item()
-        
-        avg_val_loss = val_loss / num_val_batches
-        print(f"Epoch {epoch+1}/{epochs}, Validation Loss: {avg_val_loss:.4f}")
-
-        # 学習率の調整
-        scheduler.step(avg_val_loss)
     return model
 
 if __name__ == "__main__":
     # モデル設定
     config = TransformerXLConfig(
         vocab_size=32000,
-        n_embd=512,        # 埋め込みの次元を減らす
+        n_embd=512,
         n_head=2,
         n_layer=2,
-        block_size=4096,   # ブロックサイズを増やす
-        mem_len=4096,      # メモリ長を増やす
+        block_size=4096,
+        mem_len=4096,
         dropout=0.1
     )
 
@@ -361,28 +347,20 @@ if __name__ == "__main__":
     with open('./text-generate/filtered_instruction_dataset.jsonl', 'r', encoding='utf-8') as f:
         data = [json.loads(line) for line in f]
 
+    # 保存ディレクトリの作成
+    save_directory = "./text-generate/models"
+    os.makedirs(save_directory, exist_ok=True)
+
     # データセットの作成
     train_size = int(0.9 * len(data))
     train_data, val_data = data[:train_size], data[train_size:]
     train_dataset = TextDataset(train_data, config)
     val_dataset = TextDataset(val_data, config)
 
-    # トレーニングの実行
-    model = train(model, train_dataset, val_dataset, epochs=1, batch_size=1, lr=1e-3)
-
-    # 保存ディレクトリの作成
-    save_directory = "./text-generate/models"
-    os.makedirs(save_directory, exist_ok=True)
-
-    # モデルの保存（safetensors形式）
-    model_path = os.path.join(save_directory, "japanese_transformerxl_model.safetensors")
-    state_dict = model.state_dict()
-    save_file(state_dict, model_path)
-
     # モデルの設定保存
     config_path = os.path.join(save_directory, "config.json")
     config_dict = config.to_dict()
-    with open(config_path, 'w') as f:  # テキストモードでファイルを開く
+    with open(config_path, 'w') as f:
         json.dump(config_dict, f)
 
     # トークナイザーの保存
@@ -390,5 +368,10 @@ if __name__ == "__main__":
     with open(tokenizer_path, 'wb') as f:
         pickle.dump(tokenizer, f)
 
-    print(f"トレーニングが完了し、モデルがsafetensors形式で保存されました: {model_path}")
-    print(f"トークナイザーが保存されました: {tokenizer_path}")
+    # トレーニングの実行
+    model = train(model, train_dataset, val_dataset, epochs=20000, batch_size=1, lr=1e-4, save_directory=save_directory)
+
+    # 最終モデルの保存
+    final_model_path = os.path.join(save_directory, "japanese_transformerxl_model_final.safetensors")
+    final_state_dict = model.state_dict()
+    save_file(final_state_dict, final_model_path)

@@ -45,7 +45,7 @@ def generate_text(model, tokenizer, prompt, max_length=100, temperature=1.0, top
 
 if __name__ == "__main__":
     # モデルの読み込み
-    model_path = "./text-generate/models/japanese_transformerxl_model.safetensors"
+    model_path = "./text-generate/models/japanese_transformerxl_model_epoch_60.safetensors"
     config_path = "./text-generate/models/config.json"
     tokenizer_path = "./text-generate/models/tokenizer.pkl"
 
