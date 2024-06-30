@@ -2,7 +2,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # モデルとトークナイザーの読み込み
-model_path = r"C:\Users\nider\Desktop\git\llm\text-generate\models\checkpoint-5000"
+model_path = r"C:\Users\nider\Desktop\git\llm\text-generate\models\checkpoint-4000"
 model_name = "cyberagent/open-calm-small"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(model_path)
@@ -25,9 +25,9 @@ def generate_text(prompt, min_length, max_length):
             no_repeat_ngram_size=0,  # デフォルト: 0
             do_sample=True,  # デフォルト: False
             top_k=25,  # デフォルト: 50
-            top_p=0.95,  # デフォルト: 1.0
-            temperature=0.8,  # デフォルト: 1.0
-            repetition_penalty=1.1,  # デフォルト: 1.0
+            top_p=1.00,  # デフォルト: 1.0
+            temperature=1.0,  # デフォルト: 1.0
+            repetition_penalty=1.0  # デフォルト: 1.0
         )
 
     # 生成されたテキストのデコード
